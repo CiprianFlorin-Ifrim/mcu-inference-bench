@@ -138,6 +138,12 @@ void bench_dma(void);
 // bench_int4.c -- INT4 unpack strategies (the critical bottleneck)
 void bench_int4(void);
 
+// bench_fp32.c -- FP32 operations (layer norm, softmax, SSM, gating, quant)
+void bench_fp32(void);
+
+// bench_model.c -- architecture-matched matmuls, recurrence, skip connections, token pipeline
+void bench_model(void);
+
 // ---------------------------------------------------------------------------
 // PIE assembly kernels (pie_kernels.S)
 // ---------------------------------------------------------------------------

@@ -52,10 +52,11 @@ void app_main(void)
 
     printf("\n\n");
     printf("################################################################\n");
-    printf("#          ESP32-P4 Hardware Benchmark Suite v2                #\n");
+    printf("#          ESP32-P4 Hardware Benchmark Suite v3                #\n");
     printf("#                                                              #\n");
-    printf("#  Fixes from v1: cycle counter for sub-us ops, fixed allocs,  #\n");
-    printf("#  added INT4 unpack strategies, PSRAM burst patterns          #\n");
+    printf("#  v3: added FP32 ops (norm, softmax, SSM, gating, quant),    #\n");
+    printf("#  architecture-matched matmuls, recurrence cache effects,     #\n");
+    printf("#  skip connection overhead, full token pipeline simulation    #\n");
     printf("################################################################\n");
 
     print_system_info();
@@ -67,8 +68,33 @@ void app_main(void)
     bench_cache();
     bench_dma();
     bench_int4();
+    bench_fp32();
+    bench_model();
 
     bench_separator("ALL BENCHMARKS COMPLETE");
+
+    printf("  Key numbers to extract:\n");
+    printf("    - PSRAM seq read MB/s (beyond cache)\n");
+    printf("    - PSRAM->SRAM memcpy MB/s at various sizes\n");
+    printf("    - PIE actual MACs/cycle (via mcycle CSR)\n");
+    printf("    - Cycles per esp.vmulas.s8.xacc instruction\n");
+    printf("    - Popcount cycles/word (each strategy)\n");
+    printf("    - INT4 unpack cycles/value (each strategy)\n");
+    printf("    - XNOR vs INT8 PIE ratio from SRAM\n");
+    printf("    - INT8 PSRAM: direct vs row-copy vs batch\n");
+    printf("    - Copy/compute ratio for double-buffering\n");
+    printf("    - Best INT4 pipeline vs INT8 from PSRAM\n");
+    printf("    --- NEW in v3 ---\n");
+    printf("    - LayerNorm/RMSNorm cycles at dim=256/512\n");
+    printf("    - Softmax cycles at vocab=140/256\n");
+    printf("    - SSM state update cycles (16x512, 16x256)\n");
+    printf("    - Conv1d step cycles at expand=512/1024\n");
+    printf("    - SiLU/SwiGLU gating cycles\n");
+    printf("    - Quantize/dequantize overhead\n");
+    printf("    - Architecture-matched matmul times (SRAM + PSRAM)\n");
+    printf("    - Recurrence cache warmth effect\n");
+    printf("    - Skip connection store/load overhead\n");
+    printf("    - Full token time at 1x/2x/3x/4x/6x recurrence\n");
 
     size_t min_free = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
     printf("\n  Min SRAM free during benchmarks: %zuKB\n", min_free / 1024);

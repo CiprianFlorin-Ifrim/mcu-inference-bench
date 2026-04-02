@@ -8,6 +8,8 @@ idf_component_register(
         "bench_cache.c"
         "bench_dma.c"
         "bench_int4.c"
+        "bench_fp32.c"
+        "bench_model.c"
         "pie_kernels.S"
     INCLUDE_DIRS "."
 )

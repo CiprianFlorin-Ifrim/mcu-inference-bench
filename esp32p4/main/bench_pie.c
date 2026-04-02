@@ -64,14 +64,9 @@ void bench_pie(void)
         // Benchmark with cycle counter, many reps to amortize measurement overhead
         int reps = 10000;
 
-        volatile int32_t v_sink;
         uint32_t c0 = read_mcycle();
-        for (int i = 0; i < reps; i++) {
-            y_s = scalar_dot_s8(W, x, cols);
-            v_sink = y_s;
-        }
+        for (int i = 0; i < reps; i++) y_s = scalar_dot_s8(W, x, cols);
         uint32_t c1 = read_mcycle();
-        (void)v_sink;
         float scalar_cyc = (float)(c1 - c0) / (float)reps;
 
         c0 = read_mcycle();

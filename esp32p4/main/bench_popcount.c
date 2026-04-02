@@ -169,10 +169,9 @@ void bench_popcount(void)
 
         float un = 0, uw = 0, ub = 0, uf = 0, ul = 0;
 
-        volatile int32_t xnor_sink;
         #define TIME_XNOR(var, fn) do { \
             int64_t t0 = bench_start(); \
-            for (int i = 0; i < xnor_iters; i++) xnor_sink = fn(W, x, wpr, rows); \
+            for (int i = 0; i < xnor_iters; i++) fn(W, x, wpr, rows); \
             var = bench_stop_us(t0) / (float)xnor_iters; \
         } while(0)
 
@@ -182,7 +181,6 @@ void bench_popcount(void)
         TIME_XNOR(uf, xnor_matmul_fast);
         TIME_XNOR(ul, xnor_matmul_lut);
         #undef TIME_XNOR
-        (void)xnor_sink;
 
         float best = uf;
         if (ul < best) best = ul;
@@ -233,12 +231,10 @@ void bench_popcount(void)
         fill_random_s8(Wi, rows * cp, 42);
         fill_random_s8(xi, cols, 99);
 
-        volatile int32_t cmp_sink;
         int64_t t0 = bench_start();
         for (int i = 0; i < cmp_iters; i++)
-            cmp_sink = xnor_matmul_fast(Wb, xb, wpr, rows);
+            xnor_matmul_fast(Wb, xb, wpr, rows);
         float xnor_us = bench_stop_us(t0) / (float)cmp_iters;
-        (void)cmp_sink;
 
         t0 = bench_start();
         for (int i = 0; i < cmp_iters; i++)

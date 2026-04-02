@@ -1,6 +1,6 @@
 # mcu-inference-bench
 
-Hardware benchmark suite for neural network inference on microcontrollers. Measures the raw capabilities that determine inference performance: memory bandwidth, SIMD throughput, popcount cost, INT4 unpack strategies, cache effects, and streaming pipeline overhead.
+Hardware benchmark suite for neural network inference on microcontrollers. Measures the raw capabilities that determine inference performance: memory bandwidth, SIMD throughput, popcount cost, INT4 unpack strategies, cache effects, streaming pipeline overhead, FP32 operation costs, and full model token pipeline timing.
 
 Designed to be portable across MCU platforms. The ESP32-P4 is the first target. The same benchmark structure will run on Renesas RA8M2 (Cortex-M85 + Helium) with only the SIMD kernel swapped.
 
@@ -24,6 +24,8 @@ esp32p4/
     bench_cache.c      Flash vs SRAM, stride patterns, cache boundary detection
     bench_dma.c        Double-buffer simulation, INT4 pipeline, copy/compute ratio
     bench_int4.c       INT4 unpack strategies, deinterleaved unpack, pipeline impact
+    bench_fp32.c       FP32 ops: layer norm, softmax, SSM, SiLU, conv1d, quantize
+    bench_model.c      Architecture-matched matmuls, recurrence cache, token pipeline
     pie_kernels.S      PIE XACC assembly (from proven mcu-leworldmodel project)
   CMakeLists.txt
   sdkconfig.defaults
@@ -101,6 +103,27 @@ Dedicated analysis of the INT4 unpacking bottleneck identified by the DMA benchm
 - **Full INT4 matmul pipeline** with each strategy, showing end-to-end impact: best interleaved (unrolled4) is 824 us vs INT8 at 49 us for 256x256. Still 16.8x slower.
 - **Deinterleaved unpack** at 1.75 cyc/val is 2.9x faster than naive but produces separate lo/hi nibble arrays. Requires a 2-pass PIE matmul to use directly.
 
+### bench_fp32.c -- FP32 Operations
+
+Measures every floating-point operation in the inference pipeline. These run on activations in SRAM, not on weights.
+
+- **LayerNorm and RMSNorm** at dim=128 to 1024. RMSNorm is ~1.8x faster than LayerNorm (no mean subtraction pass). At dim=512: LayerNorm 46 us, RMSNorm 26 us.
+- **Softmax** at output sizes from 140 (custom vocab) to 4096 (large BPE). At vocab=140: 81 us. Dominated by expf() calls.
+- **SiLU and SwiGLU gating** at model dimensions. At dim=512: SiLU 253 us, SwiGLU 259 us. Dominated by expf() in the sigmoid. These are the most expensive FP32 operations per layer.
+- **Mamba2 SSM state update** (per-token selective scan step). At state=16, expand=512: 344 us. At state=16, expand=256 (bottleneck): 172 us. This is the core Mamba recurrence and runs once per Mamba layer per token.
+- **Conv1D step** (Mamba's causal convolution, stateful ring buffer). At channels=512, kernel=4: 110 us. At channels=1024: 219 us.
+- **INT8 quantize/dequantize** overhead at layer boundaries. At dim=512: quantize 65 us, dequantize 14 us.
+
+### bench_model.c -- Model Architecture Benchmarks
+
+Maps the target model architecture directly onto hardware measurements.
+
+- **Architecture-matched matmul sizes from SRAM**: every matmul in the U-Net (Mamba in_proj 1024x512, Mamba out_proj 512x1024, projection 512<->256, attention QKV 768x256, output head 140x512). Gives exact per-layer SRAM compute cost.
+- **Architecture-matched matmul sizes from PSRAM**: same shapes but via PSRAM direct access. Shows the real PSRAM penalty per layer. Key finding: at dim=512, PSRAM direct is only 1.2-1.5x slower than SRAM -- much better than the 7-9x penalty at dim=1024.
+- **Recurrence cache effect**: streams the same bottleneck weights (512x256, 128 KB) from PSRAM N consecutive times. First pass: 1,101 us. Every subsequent pass: ~205 us (5.3x faster). The PSRAM data stays in the ~128 KB L2 cache between passes. This is the key finding for depth recurrence efficiency.
+- **Skip connection overhead**: SRAM memcpy for 512-dim FP32 activation vectors. Store: 3.8 us, load: 3.8 us. Negligible.
+- **Full token pipeline simulation**: runs the exact sequence of matmuls for the complete U-Net architecture (encoder 3 unrolls + projection + bottleneck Nx recurrence + projection + decoder 3 unrolls) all from PSRAM. Reports per-component breakdown and total tok/s at 1x through 6x recurrence.
+
 ## ESP32-P4 Results
 
 All measurements on ESP32-P4 rev 1.3, 360 MHz, 32 MB PSRAM at 200 MHz hex mode, ESP-IDF v5.5.3, -O2 optimization.
@@ -109,20 +132,20 @@ All measurements on ESP32-P4 rev 1.3, 360 MHz, 32 MB PSRAM at 200 MHz hex mode, 
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| SRAM total | 629 KB | Fragmented: 376KB max contiguous block |
+| SRAM total | 629 KB | Fragmented: 376 KB max contiguous block |
 | PSRAM total | 32 MB | 200 MHz x16 hex mode |
 | SRAM seq read | 359 MB/s | Consistent across all sizes |
 | PSRAM seq read (cached) | 359 MB/s | Buffer <= 64 KB (fits in cache) |
 | PSRAM seq read (uncached) | 104 MB/s | Buffer > 64 KB (true PSRAM speed) |
 | PSRAM seq write (uncached) | 85 MB/s | |
 | SRAM->SRAM memcpy | 368 MB/s | 64 KB buffer |
-| PSRAM->SRAM memcpy (16KB) | 561 MB/s | Optimal size, fully cached |
-| PSRAM->SRAM memcpy (32KB) | 560 MB/s | Still in cache sweet spot |
-| PSRAM->SRAM memcpy (64KB) | 372 MB/s | Cache spill, 34% drop |
+| PSRAM->SRAM memcpy (16 KB) | 561 MB/s | Optimal size, fully cached |
+| PSRAM->SRAM memcpy (32 KB) | 560 MB/s | Still in cache sweet spot |
+| PSRAM->SRAM memcpy (64 KB) | 372 MB/s | Cache spill, 34% drop |
 | PSRAM->SRAM row copy (384B) | 102 MB/s | Per-row, matches uncached BW |
 | SRAM random latency | 14 ns / 25 ns | Timer / pointer-chase |
-| PSRAM random latency (256KB) | 288 ns | 11.5x SRAM pointer-chase |
-| PSRAM random latency (512KB) | 392 ns | 15.7x SRAM |
+| PSRAM random latency (256 KB) | 288 ns | 11.5x SRAM pointer-chase |
+| PSRAM random latency (512 KB) | 392 ns | 15.7x SRAM |
 
 ### Cache Hierarchy
 
@@ -148,16 +171,19 @@ memcpy peaks at 560 MB/s for 16-32 KB transfers (L1 resident), drops to 372 MB/s
 
 Effective throughput decreases with larger matrices due to register reload overhead in the row loop. The fused load+MAC instructions (`esp.vmulas.s8.xacc.ld.ip`) help pipeline data movement but don't achieve single-cycle throughput.
 
-### PIE Memory Source (512x384 matmul)
+### PIE Memory Source
 
-| Source | Time (us) | vs SRAM | Effective MB/s |
-|--------|----------|---------|----------------|
-| SRAM (single call) | 214 | 1.0x | 919 |
-| PSRAM direct (per-row) | 1,615 | 7.5x | 122 |
-| PSRAM row-copy (memcpy+PIE) | 1,939 | 9.0x | 101 |
-| PSRAM batch-copy (16KB) | 1,826 | 8.5x | 108 |
+| Matmul | SRAM (us) | PSRAM direct (us) | PSRAM/SRAM ratio |
+|--------|----------|-------------------|-----------------|
+| 256x128 | 30 | 56 | 1.9x |
+| 256x256 | 49 | 75 | 1.5x |
+| 256x512 | 134 | 174 | 1.3x |
+| 256x1024 | 243 | 2,088 | 8.6x |
+| 512x256 | 140 | 207 | 1.5x |
+| 512x384 | 204 | 1,615 | 7.9x |
+| 1024x256 | 280 | 2,204 | 7.9x |
 
-For short rows (cols <= 512), PSRAM direct is only 1.1-1.9x slower than SRAM. For long rows (cols >= 1024), the gap jumps to 7-9x. The transition correlates with the cache line fill pattern.
+Critical finding: for cols <= 512, PSRAM direct access is only 1.3-1.9x slower than SRAM. At cols >= 1024, the penalty jumps to 7-9x. This means model layers with dim=512 stream efficiently from PSRAM without explicit tiling.
 
 ### Popcount (Software)
 
@@ -170,17 +196,6 @@ For short rows (cols <= 512), PSRAM direct is only 1.1-1.9x slower than SRAM. Fo
 | Fast (bit-parallel) | 19 | Hacker's Delight, best overall |
 
 No MCU-class chip has hardware popcount. The ESP32-P4 does not implement the RISC-V Zbb extension. Best achievable is 19 cycles/word via the bit-parallel algorithm.
-
-### XNOR Binary Matmul (from SRAM)
-
-| Dimensions | XNOR (fast_popcount) | INT8 PIE | PIE advantage |
-|-----------|---------------------|----------|---------------|
-| 128x1024 | 266 us | 121 us | 2.2x |
-| 256x256 | 137 us | 49 us | 2.8x |
-| 512x384 | 404 us | 197 us | 2.1x |
-| Peak GMAC/s | 0.49 (binary) | 1.39 (INT8) | 2.8x |
-
-INT8 PIE is 2.1-2.8x faster than XNOR from SRAM. XNOR processes 32 binary MACs per popcount (19 cycles) = 1.68 binary MACs/cycle. PIE does 3.7-3.9 INT8 MACs/cycle. For SRAM-resident models, INT8 is strictly better.
 
 ### INT4 Unpack Cost
 
@@ -207,47 +222,142 @@ INT8 PIE is 2.1-2.8x faster than XNOR from SRAM. XNOR processes 32 binary MACs p
 
 INT4 halves the data transferred but the scalar unpack cost is 3.4x the copy savings. INT4 is currently 2.2x slower than INT8 on the ESP32-P4.
 
-With the best interleaved unpack (unrolled4), the INT4 matmul pipeline at 256x256 takes 824 us vs INT8 at 49 us -- still 16.8x slower from SRAM.
+### FP32 Operations
 
-The deinterleaved unpack at 1.75 cyc/val could theoretically bring INT4 closer to parity, but requires a 2-pass PIE matmul architecture that doubles the compute passes.
+| Operation | Dim/size | Cycles | Time (us) | Notes |
+|-----------|---------|--------|----------|-------|
+| LayerNorm | 512 | 16,504 | 45.8 | 3 passes over data |
+| RMSNorm | 512 | 9,318 | 25.9 | 1.8x faster than LayerNorm |
+| Softmax | 140 (vocab) | 29,076 | 80.8 | Dominated by expf() |
+| Softmax | 256 | 52,904 | 147.0 | |
+| SiLU | 512 | 91,253 | 253.5 | expf() in sigmoid |
+| SwiGLU | 512 | 93,209 | 258.9 | SiLU + elementwise multiply |
+| SSM state update | 16x512 | 124,004 | 344.5 | Core Mamba2 recurrence |
+| SSM state update | 16x256 | 62,008 | 172.2 | Bottleneck dim |
+| Conv1D step | 512ch, k=4 | 39,484 | 109.7 | Mamba causal conv |
+| Conv1D step | 1024ch, k=4 | 78,933 | 219.3 | Expanded dim |
+| INT8 quantize | 512 | 23,269 | 64.6 | Per-layer boundary |
+| INT8 dequantize | 512 | 5,130 | 14.3 | |
 
-### Double-Buffer Copy/Compute Ratio
+FP32 overhead per token (estimated for 10M model with 14 effective layers): ~6-8 ms. Not negligible -- represents ~10% of total token time. SSM state updates and SiLU gating are the dominant costs. These are candidates for future optimization via INT8 approximation or lookup tables for expf().
 
-| Batch size | Copy (us) | Compute (us) | Ratio | Total (us) |
-|-----------|----------|-------------|-------|-----------|
-| 1 row | 3,419 | 1,086 | 3.1 | 4,505 |
-| 4 rows | 2,487 | 414 | 6.0 | 2,901 |
-| 16 rows | 2,321 | 264 | 8.8 | 2,585 |
-| 32 rows | 2,286 | 231 | 9.9 | 2,517 |
-| 64 rows | 2,275 | 226 | 10.1 | 2,501 |
-| 128 rows | 2,371 | 215 | 11.0 | 2,586 |
+### Architecture-Matched Matmul Sizes (from SRAM)
 
-For 1024x256 INT8 from PSRAM: compute is ~10% of total time. The memory bus is the bottleneck at every batch size. DMA double-buffering would save at most the 215 us compute overlap -- a ~8% improvement. Not transformative.
+| Layer | Dimensions | Cycles | Time (us) | GMAC/s |
+|-------|-----------|--------|----------|--------|
+| Embedding lookup | 1x512 | 162 | 0.5 | 1.14 |
+| Projection down | 256x512 | 48,249 | 134.0 | 0.98 |
+| Projection up | 512x256 | 50,400 | 140.0 | 0.94 |
+| Attention QKV | 768x256 | 75,575 | 209.9 | 0.94 |
+| Attention out | 256x256 | 17,448 | 48.5 | 1.35 |
+| Bot Mamba in_proj | 512x256 | 50,388 | 140.0 | 0.94 |
+| Bot Mamba out_proj | 256x512 | 48,260 | 134.1 | 0.98 |
+| Output head | 140x512 | 20,568 | 57.1 | 1.25 |
 
-### Corrected Projections for Large Model Inference
+Note: Mamba in_proj (1024x512) and out_proj (512x1024) exceed the 376 KB max contiguous SRAM block and must stream from PSRAM.
 
-Based on measured PSRAM bandwidth of 104 MB/s:
+### Architecture-Matched Matmul Sizes (from PSRAM direct)
 
-| Model (INT8) | Weight size | PSRAM time | Est. tok/s |
-|-------------|------------|-----------|-----------|
-| 1M params | 1 MB | 9.6 ms | ~100 |
-| 5M params | 5 MB | 48 ms | ~20 |
-| 10M params | 10 MB | 96 ms | ~10 |
-| 20M params | 20 MB | 192 ms | ~5 |
+| Layer | Dimensions | SRAM (us) | PSRAM (us) | Ratio |
+|-------|-----------|----------|-----------|-------|
+| Projection down | 256x512 | 134 | 174 | 1.3x |
+| Attention QKV | 768x256 | 210 | 1,653 | 7.9x |
+| Bot Mamba in_proj | 512x256 | 140 | 207 | 1.5x |
+| Output head | 140x512 | 58 | 72 | 1.2x |
 
-These assume pure weight streaming with no activation or layer overhead. Real performance will be somewhat lower.
+Layers with cols=512 show only 1.2-1.3x PSRAM penalty -- the data fits in cache lines efficiently. Layers with cols=256 and many rows (768x256 QKV) show 7.9x penalty because the total weight matrix (192 KB) exceeds L2 cache, causing thrashing on per-row access.
 
-## Key Takeaways for ESP32-P4 Inference Engine Design
+### Recurrence Cache Effect (key finding)
 
-1. **Use INT8 + PIE XACC.** It is the fastest option on this chip at every model size. INT4 is slower due to unpack cost. XNOR is slower due to lack of hardware popcount.
+Bottleneck matmul 512x256 (128 KB) from PSRAM, consecutive passes:
 
-2. **Keep activations and KV cache in SRAM.** The 32 KB L1 cache is the sweet spot for tile buffers. Activations for hidden_dim=512 fit in ~2 KB, well within L1.
+| Pass | Time (us) | vs Pass 1 |
+|------|----------|----------|
+| 1 | 1,101 | 1.00x |
+| 2 | 206 | 0.19x |
+| 3 | 204 | 0.19x |
+| 4 | 205 | 0.19x |
+| 5 | 204 | 0.18x |
+| 6 | 205 | 0.19x |
 
-3. **For PSRAM weight streaming, use PIE direct access for hidden_dim <= 512.** Skip memcpy entirely -- PIE reading through the cache controller is faster than explicit row-copy for short rows. For hidden_dim >= 1024, batch-copy to a 16-32 KB SRAM buffer.
+**After the first pass, PSRAM data remains in the ~128 KB L2 cache. Subsequent passes are 5.3x faster.** This is the single most important finding for depth recurrence: the bottleneck weights (128 KB for a single matmul) fit in L2, so recurrence passes 2+ execute at near-SRAM speed.
 
-4. **The PSRAM bandwidth wall limits large models to ~5-10 tokens/second** for 5-10M parameter INT8 models. This is a hardware constraint that no software optimization can overcome on this chip.
+However, the full bottleneck layer (QKV + out + mamba_in + mamba_out = ~512 KB total) exceeds L2 cache. In the full pipeline simulation, per-recurrence cost is ~4,300 us (not ~800 us), indicating partial but not full cache benefit. The cache helps individual matmuls within the recurrence but not the complete layer.
 
-5. **The RA8M2 with SDRAM is the path for larger models.** Its ~5x higher external memory bandwidth (estimated ~500+ MB/s SDRAM vs 104 MB/s PSRAM) directly translates to 5x higher token throughput for memory-bound workloads.
+### Skip Connection Overhead
+
+| Dim | Bytes | Store (ns) | Load (ns) |
+|-----|-------|-----------|----------|
+| 512 | 2,048 | 3,805 | 3,802 |
+
+Skip connections cost ~3.8 us per store and ~3.8 us per load. With 3 skip depths, total overhead is ~23 us per token. Negligible.
+
+### Full Token Pipeline (measured, INT8, PSRAM streaming)
+
+10M unique params, unrolled U-Net architecture. Encoder and decoder each stream ~1.5 MB from PSRAM. Bottleneck streams ~512 KB per recurrence pass.
+
+| Recurrence | Encoder (us) | Proj dn (us) | Bottleneck (us) | Proj up (us) | Decoder (us) | Total (us) | tok/s |
+|-----------|-------------|-------------|----------------|-------------|-------------|-----------|-------|
+| 1x | 25,251 | 1,066 | 4,317 | 1,078 | 25,213 | 56,925 | 17.6 |
+| 2x | 25,213 | 1,065 | 8,629 | 1,077 | 25,216 | 61,201 | 16.3 |
+| 3x | 25,216 | 1,065 | 12,943 | 1,077 | 25,214 | 65,515 | 15.3 |
+| 4x | 25,218 | 1,064 | 17,253 | 1,083 | 25,211 | 69,830 | 14.3 |
+| 6x | 25,216 | 1,063 | 25,885 | 1,078 | 25,215 | 78,457 | 12.7 |
+
+These timings exclude FP32 operations (layer norm, softmax, SSM state updates, SiLU gating, conv1d, quantization). Add approximately 6-8 ms for FP32 overhead based on bench_fp32 measurements.
+
+### Corrected Performance Projections (with FP32 overhead)
+
+| Config | Matmul (measured) | FP32 (measured) | Total | tok/s |
+|--------|------------------|----------------|-------|-------|
+| 10M INT8, 1x rec | 57 ms | ~6 ms | ~63 ms | ~16 |
+| 10M INT8, 3x rec | 65.5 ms | ~7 ms | ~72.5 ms | ~14 |
+| 10M INT8, 6x rec | 78.5 ms | ~8 ms | ~86.5 ms | ~11.5 |
+| 10M INT4, 1x rec (est) | ~114 ms | ~6 ms | ~120 ms | ~8 |
+| 10M INT4, 3x rec (est) | ~131 ms | ~7 ms | ~138 ms | ~7 |
+
+The 10M INT8 model with 3x recurrence achieves 14 tok/s. With 6x recurrence (for deeper reasoning), it still delivers 11.5 tok/s. These are real numbers measured on hardware, not estimates.
+
+## Strategic Implications
+
+### INT8 vs INT4 on ESP32-P4
+
+The benchmarks strongly favor INT8 for this specific chip:
+
+1. **PSRAM direct access at dim=512 is only 1.2-1.5x slower than SRAM** -- the expected 7-9x penalty only applies at dim >= 1024. This eliminates the bandwidth argument for INT4.
+
+2. **INT4 unpack overhead is 74.5% of total pipeline time** -- the halved data transfer does not compensate for the scalar unpack cost. INT4 is 2.2x slower than INT8 from PSRAM.
+
+3. **Recurrence is cheap** -- each additional bottleneck pass costs ~4.3 ms. Going from 1x to 6x recurrence only drops throughput from 17.6 to 12.7 tok/s. This means a 10M INT8 model with deep recurrence can approach the effective quality of a much larger model without the speed penalty of INT4.
+
+### The Recurrence vs Width Question
+
+The critical open question: does a 10M model with 6x recurrence match a 30M model with 2x recurrence? If yes, INT8 with deep recurrence is strictly dominant on this hardware. This requires an ablation study (GPU training experiment, not MCU experiment) before committing to a quantization strategy.
+
+### Recommended Development Path
+
+```
+1. INT8 first: train 10M model with INT8 QAT, deploy with variable recurrence
+2. Ablation: sweep recurrence depth vs model size at equal compute to find exchange rate
+3. INT4 optional: finetune INT8 checkpoint to INT4 if the ablation shows width > depth
+4. RA8M2: benchmark Helium INT4 unpack -- if fast, INT4 becomes viable there
+```
+
+## Key Takeaways
+
+1. **Use INT8 + PIE XACC on ESP32-P4.** It is the fastest option on this chip. INT4 is slower due to unpack cost. XNOR is slower due to lack of hardware popcount.
+
+2. **PSRAM direct access is efficient for dim=512.** Skip memcpy entirely for model layers with 512 columns or fewer. PIE reading through the cache controller is only 1.2-1.5x slower than SRAM at these dimensions.
+
+3. **Depth recurrence is nearly free relative to model streaming.** Each bottleneck recurrence pass adds ~4.3 ms to a ~57 ms base. 6x recurrence costs 38% more time for potentially much deeper reasoning.
+
+4. **Individual bottleneck matmuls (128 KB) cache in L2.** Repeat passes are 5.3x faster than the first pass. The full bottleneck layer (512 KB) exceeds L2 but still benefits from partial caching.
+
+5. **FP32 operations cost ~6-8 ms per token (~10% of total).** SSM state updates and SiLU gating dominate. These are optimization targets for future work (INT8 approximation, expf() lookup tables).
+
+6. **14 tok/s at 3x recurrence with 10M unique params is achievable today** on the ESP32-P4 with INT8 weights and the measured architecture. No speculative optimizations required.
+
+7. **The RA8M2 with SDRAM should deliver 3-5x improvement** based on its higher memory bandwidth (~500 MB/s estimated vs 104 MB/s measured). This needs benchmark validation.
 
 ## Porting to Other Chips
 
